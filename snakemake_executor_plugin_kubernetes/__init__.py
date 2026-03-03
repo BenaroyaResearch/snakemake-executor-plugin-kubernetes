@@ -196,6 +196,9 @@ class Executor(RemoteExecutor):
         )
         self.privileged = self.workflow.executor_settings.privileged
         self.persistent_volumes = self.workflow.executor_settings.persistent_volumes
+        # Capture the workflow working directory so job pods can run in the
+        # same directory on the shared filesystem instead of /workdir.
+        self.workdir = os.getcwd()
 
         self.logger.info(f"Using {self.container_image} for Kubernetes jobs.")
 
@@ -230,7 +233,15 @@ class Executor(RemoteExecutor):
         container.image = self.container_image
         container.command = shlex.split("/bin/sh")
         container.args = ["-c", exec_job]
-        container.working_dir = "/workdir"
+
+        # When persistent volumes are configured (shared FS), run in the
+        # actual workflow directory so outputs land on NFS.  Otherwise
+        # fall back to /workdir (emptyDir) for the cloud-style workflow.
+        if self.persistent_volumes:
+            container.working_dir = self.workdir
+        else:
+            container.working_dir = "/workdir"
+
         container.volume_mounts = [
             kubernetes.client.V1VolumeMount(
                 name="workdir", mount_path="/workdir"
