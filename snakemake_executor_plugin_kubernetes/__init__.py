@@ -144,9 +144,10 @@ common_settings = CommonSettings(
     non_local_exec=True,
     # Define whether your executor plugin implies that there is no shared
     # filesystem (True) or not (False).
-    # This is e.g. the case for cloud execution.
-    implies_no_shared_fs=True,
-    job_deploy_sources=True,
+    # BRI fork: set to False because our K8s jobs mount the same NFS-backed
+    # PVCs as the workspace pod, so a shared filesystem IS available.
+    implies_no_shared_fs=False,
+    job_deploy_sources=False,
     pass_default_storage_provider_args=True,
     pass_default_resources_args=True,
     pass_envvar_declarations_to_cmd=False,
