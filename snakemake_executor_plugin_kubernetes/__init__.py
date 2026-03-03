@@ -318,12 +318,45 @@ class Executor(RemoteExecutor):
             ]
         )
 
+        # Pod anti-affinity: prefer not co-locating with coder-workspace pods
+        pod_anti_affinity = kubernetes.client.V1PodAntiAffinity(
+            preferred_during_scheduling_ignored_during_execution=[
+                kubernetes.client.V1WeightedPodAffinityTerm(
+                    weight=1,
+                    pod_affinity_term=kubernetes.client.V1PodAffinityTerm(
+                        topology_key="kubernetes.io/hostname",
+                        label_selector=kubernetes.client.V1LabelSelector(
+                            match_expressions=[
+                                kubernetes.client.V1LabelSelectorRequirement(
+                                    key="app.kubernetes.io/name",
+                                    operator="In",
+                                    values=["coder-workspace"],
+                                )
+                            ]
+                        ),
+                    ),
+                )
+            ]
+        )
+
         # Initialize PodSpec
         pod_spec = kubernetes.client.V1PodSpec(
             containers=[container],
             node_selector=node_selector,
             restart_policy="Never",
-            affinity=kubernetes.client.V1Affinity(node_affinity=node_affinity),
+            affinity=kubernetes.client.V1Affinity(
+                node_affinity=node_affinity,
+                pod_anti_affinity=pod_anti_affinity,
+            ),
+            tolerations=[
+                # Tolerate the HPC taint so pods can schedule on HPC nodes
+                kubernetes.client.V1Toleration(
+                    key="brivmrc.org/role",
+                    operator="Equal",
+                    value="hpc",
+                    effect="NoSchedule",
+                ),
+            ],
         )
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
