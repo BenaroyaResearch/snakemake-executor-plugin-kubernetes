@@ -29,18 +29,26 @@ from snakemake_interface_executor_plugins.settings import DeploymentMethod
 class PersistentVolume:
     name: str
     path: Path
+    sub_path: Optional[str] = None
 
     @classmethod
     def parse(cls, arg: str) -> Self:
         spec = arg.split(":")
-        if len(spec) != 2:
+        if len(spec) == 2:
+            name, path = spec
+            return cls(name=name, path=Path(path))
+        elif len(spec) == 3:
+            name, path, sub_path = spec
+            return cls(name=name, path=Path(path), sub_path=sub_path)
+        else:
             raise WorkflowError(
-                f"Invalid persistent volume spec ({arg}), has to be <name>:<path>."
+                f"Invalid persistent volume spec ({arg}), "
+                "has to be <name>:<path> or <name>:<path>:<sub_path>."
             )
-        name, path = spec
-        return cls(name=name, path=Path(path))
 
     def unparse(self) -> str:
+        if self.sub_path:
+            return f"{self.name}:{self.path}:{self.sub_path}"
         return f"{self.name}:{self.path}"
 
 
@@ -217,12 +225,13 @@ class Executor(RemoteExecutor):
             ),
         ]
 
-        # Volume mounts
+        # Volume mounts (sub_path is optional per mount)
         for pvc in self.persistent_volumes:
+            mount_kwargs = {"name": pvc.name, "mount_path": str(pvc.path)}
+            if pvc.sub_path:
+                mount_kwargs["sub_path"] = pvc.sub_path
             container.volume_mounts.append(
-                kubernetes.client.V1VolumeMount(
-                    name=pvc.name, mount_path=str(pvc.path)
-                )
+                kubernetes.client.V1VolumeMount(**mount_kwargs)
             )
 
         # Node selector
@@ -345,14 +354,20 @@ class Executor(RemoteExecutor):
         workdir_volume.empty_dir = kubernetes.client.V1EmptyDirVolumeSource()
         pod_spec.volumes = [workdir_volume]
 
+        # Deduplicate volumes: the same PVC may be mounted at multiple
+        # paths (with different sub_paths), but K8s needs exactly one
+        # V1Volume per claim name.
+        seen_pvc_names = set()
         for pvc in self.persistent_volumes:
-            volume = kubernetes.client.V1Volume(name=pvc.name)
-            volume.persistent_volume_claim = (
-                kubernetes.client.V1PersistentVolumeClaimVolumeSource(
-                    claim_name=pvc.name
+            if pvc.name not in seen_pvc_names:
+                seen_pvc_names.add(pvc.name)
+                volume = kubernetes.client.V1Volume(name=pvc.name)
+                volume.persistent_volume_claim = (
+                    kubernetes.client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=pvc.name
+                    )
                 )
-            )
-            pod_spec.volumes.append(volume)
+                pod_spec.volumes.append(volume)
 
         # Env vars
         container.env = []
