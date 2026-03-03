@@ -60,6 +60,23 @@ def unparse_persistent_volumes(args: List[PersistentVolume]) -> List[str]:
     return [arg.unparse() for arg in args]
 
 
+def parse_custom_labels(args: List[str]) -> dict:
+    """Parse key=value label pairs into a dict."""
+    labels = {}
+    for arg in args:
+        if "=" not in arg:
+            raise WorkflowError(
+                f"Invalid label spec '{arg}', must be key=value."
+            )
+        key, value = arg.split("=", 1)
+        labels[key] = value
+    return labels
+
+
+def unparse_custom_labels(labels: dict) -> List[str]:
+    return [f"{k}={v}" for k, v in labels.items()]
+
+
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
     namespace: str = field(
@@ -140,6 +157,17 @@ class ExecutorSettings(ExecutorSettingsBase):
             "automatic cleanups."
         },
     )
+    custom_labels: dict = field(
+        default_factory=dict,
+        metadata={
+            "help": "Additional labels to apply to each job pod "
+            "(key=value). For example: "
+            "com.example.team=data-eng com.example.env=prod",
+            "parse_func": parse_custom_labels,
+            "unparse_func": unparse_custom_labels,
+            "nargs": "+",
+        },
+    )
 
 
 # Required:
@@ -196,6 +224,7 @@ class Executor(RemoteExecutor):
         )
         self.privileged = self.workflow.executor_settings.privileged
         self.persistent_volumes = self.workflow.executor_settings.persistent_volumes
+        self.custom_labels = dict(self.workflow.executor_settings.custom_labels)
         # Capture the workflow working directory so job pods can run in the
         # same directory on the shared filesystem instead of /workdir.
         self.workdir = os.getcwd()
@@ -223,9 +252,13 @@ class Executor(RemoteExecutor):
         )
 
         body = kubernetes.client.V1Job()
-        body.metadata = kubernetes.client.V1ObjectMeta(
-            labels={"app": "snakemake"}
-        )
+        # Build job labels: default app label + com.coder.user.username + custom
+        job_labels = {"app": "snakemake"}
+        username = os.environ.get("USER") or os.environ.get("USERNAME", "")
+        if username:
+            job_labels["com.coder.user.username"] = username
+        job_labels.update(self.custom_labels)
+        body.metadata = kubernetes.client.V1ObjectMeta(labels=job_labels)
         body.metadata.name = jobid
 
         # Container setup
@@ -267,11 +300,30 @@ class Executor(RemoteExecutor):
                 f"Set node selector for machine type: {node_selector}"
             )
 
+        # Node affinity: prefer nodes with brivmrc.org/role=hpc
+        node_affinity = kubernetes.client.V1NodeAffinity(
+            preferred_during_scheduling_ignored_during_execution=[
+                kubernetes.client.V1PreferredSchedulingTerm(
+                    weight=100,
+                    preference=kubernetes.client.V1NodeSelectorTerm(
+                        match_expressions=[
+                            kubernetes.client.V1NodeSelectorRequirement(
+                                key="brivmrc.org/role",
+                                operator="In",
+                                values=["hpc"],
+                            )
+                        ]
+                    ),
+                )
+            ]
+        )
+
         # Initialize PodSpec
         pod_spec = kubernetes.client.V1PodSpec(
             containers=[container],
             node_selector=node_selector,
             restart_policy="Never",
+            affinity=kubernetes.client.V1Affinity(node_affinity=node_affinity),
         )
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
