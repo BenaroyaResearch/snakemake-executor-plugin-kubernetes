@@ -1,5 +1,6 @@
 import base64
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -54,7 +55,8 @@ def unparse_persistent_volumes(args: List[PersistentVolume]) -> List[str]:
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
     namespace: str = field(
-        default="default", metadata={"help": "The namespace to use for submitted jobs."}
+        default="default",
+        metadata={"help": "The namespace to use for submitted jobs."},
     )
     cpu_scalar: float = field(
         default=0.95,
@@ -79,6 +81,24 @@ class ExecutorSettings(ExecutorSettingsBase):
             "pod specs. This is e.g. needed when using workload "
             "identity which is enforced "
             "when using Google Cloud GKE Autopilot."
+        },
+    )
+    run_as_user: Optional[int] = field(
+        default_factory=os.getuid,
+        metadata={
+            "help": "The pod's securityContext runAsUser. "
+            "Defaults to the current user's UID. "
+            "Useful when job pods must match a specific user identity "
+            "for NFS or shared filesystem permissions."
+        },
+    )
+    run_as_group: Optional[int] = field(
+        default_factory=os.getgid,
+        metadata={
+            "help": "The pod's securityContext runAsGroup (and fsGroup). "
+            "Defaults to the current user's GID. "
+            "Useful when job pods must match a specific group "
+            "identity for NFS or shared filesystem permissions."
         },
     )
     privileged: Optional[bool] = field(
@@ -140,6 +160,8 @@ class Executor(RemoteExecutor):
         self.k8s_service_account_name = (
             self.workflow.executor_settings.service_account_name
         )
+        self.k8s_run_as_user = self.workflow.executor_settings.run_as_user
+        self.k8s_run_as_group = self.workflow.executor_settings.run_as_group
         self.kubeapi = kubernetes.client.CoreV1Api()
         self.batchapi = kubernetes.client.BatchV1Api()
         self.namespace = self.workflow.executor_settings.namespace
@@ -149,7 +171,9 @@ class Executor(RemoteExecutor):
         self.register_secret()
         self.log_path = self.workflow.persistence.aux_path / "kubernetes-logs"
         self.log_path.mkdir(exist_ok=True, parents=True)
-        self.container_image = self.workflow.remote_execution_settings.container_image
+        self.container_image = (
+            self.workflow.remote_execution_settings.container_image
+        )
         self.privileged = self.workflow.executor_settings.privileged
         self.persistent_volumes = self.workflow.executor_settings.persistent_volumes
 
@@ -176,7 +200,9 @@ class Executor(RemoteExecutor):
         )
 
         body = kubernetes.client.V1Job()
-        body.metadata = kubernetes.client.V1ObjectMeta(labels={"app": "snakemake"})
+        body.metadata = kubernetes.client.V1ObjectMeta(
+            labels={"app": "snakemake"}
+        )
         body.metadata.name = jobid
 
         # Container setup
@@ -186,13 +212,17 @@ class Executor(RemoteExecutor):
         container.args = ["-c", exec_job]
         container.working_dir = "/workdir"
         container.volume_mounts = [
-            kubernetes.client.V1VolumeMount(name="workdir", mount_path="/workdir"),
+            kubernetes.client.V1VolumeMount(
+                name="workdir", mount_path="/workdir"
+            ),
         ]
 
         # Volume mounts
         for pvc in self.persistent_volumes:
             container.volume_mounts.append(
-                kubernetes.client.V1VolumeMount(name=pvc.name, mount_path=str(pvc.path))
+                kubernetes.client.V1VolumeMount(
+                    name=pvc.name, mount_path=str(pvc.path)
+                )
             )
 
         # Node selector
@@ -201,11 +231,15 @@ class Executor(RemoteExecutor):
             node_selector["node.kubernetes.io/instance-type"] = resources_dict[
                 "machine_type"
             ]
-            self.logger.debug(f"Set node selector for machine type: {node_selector}")
+            self.logger.debug(
+                f"Set node selector for machine type: {node_selector}"
+            )
 
         # Initialize PodSpec
         pod_spec = kubernetes.client.V1PodSpec(
-            containers=[container], node_selector=node_selector, restart_policy="Never"
+            containers=[container],
+            node_selector=node_selector,
+            restart_policy="Never",
         )
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
@@ -290,6 +324,22 @@ class Executor(RemoteExecutor):
                 f"Set service account name: {self.k8s_service_account_name}"
             )
 
+        # Set pod-level security context if runAsUser/runAsGroup specified
+        if self.k8s_run_as_user is not None or self.k8s_run_as_group is not None:
+            sc_kwargs = {}
+            if self.k8s_run_as_user is not None:
+                sc_kwargs["run_as_user"] = self.k8s_run_as_user
+            if self.k8s_run_as_group is not None:
+                sc_kwargs["run_as_group"] = self.k8s_run_as_group
+                sc_kwargs["fs_group"] = self.k8s_run_as_group
+            pod_spec.security_context = kubernetes.client.V1PodSecurityContext(
+                **sc_kwargs
+            )
+            self.logger.debug(
+                f"Set pod security context: runAsUser={self.k8s_run_as_user}, "
+                f"runAsGroup={self.k8s_run_as_group}"
+            )
+
         # Workdir volume
         workdir_volume = kubernetes.client.V1Volume(name="workdir")
         workdir_volume.empty_dir = kubernetes.client.V1EmptyDirVolumeSource()
@@ -309,8 +359,10 @@ class Executor(RemoteExecutor):
         for key, e in self.secret_envvars.items():
             envvar = kubernetes.client.V1EnvVar(name=e)
             envvar.value_from = kubernetes.client.V1EnvVarSource()
-            envvar.value_from.secret_key_ref = kubernetes.client.V1SecretKeySelector(
-                key=key, name=self.run_namespace
+            envvar.value_from.secret_key_ref = (
+                kubernetes.client.V1SecretKeySelector(
+                    key=key, name=self.run_namespace
+                )
             )
             container.env.append(envvar)
 
@@ -331,7 +383,9 @@ class Executor(RemoteExecutor):
         )
 
         if not scale_value:
-            container.resources.limits["cpu"] = "{}m".format(int(cores * 1000))
+            container.resources.limits["cpu"] = "{}m".format(
+                int(cores * 1000)
+            )
 
         if "mem_mb" in resources_dict:
             mem_mb = resources_dict["mem_mb"]
@@ -341,9 +395,13 @@ class Executor(RemoteExecutor):
         # Disk
         if "disk_mb" in resources_dict:
             disk_mb = int(resources_dict.get("disk_mb", 1024))
-            container.resources.requests["ephemeral-storage"] = f"{disk_mb}M"
+            container.resources.requests[
+                "ephemeral-storage"
+            ] = f"{disk_mb}M"
             if not scale_value:
-                container.resources.limits["ephemeral-storage"] = f"{disk_mb}M"
+                container.resources.limits[
+                    "ephemeral-storage"
+                ] = f"{disk_mb}M"
 
         # Request GPU resources if specified
         if "gpu" in resources_dict:
@@ -357,12 +415,16 @@ class Executor(RemoteExecutor):
                 container.resources.requests["nvidia.com/gpu"] = gpu_count
                 if not scale_value:
                     container.resources.limits["nvidia.com/gpu"] = gpu_count
-                self.logger.debug(f"Requested NVIDIA GPU resources: {gpu_count}")
+                self.logger.debug(
+                    f"Requested NVIDIA GPU resources: {gpu_count}"
+                )
             elif manufacturer == "amd":
                 container.resources.requests["amd.com/gpu"] = gpu_count
                 if not scale_value:
                     container.resources.limits["amd.com/gpu"] = gpu_count
-                self.logger.debug(f"Requested AMD GPU resources: {gpu_count}")
+                self.logger.debug(
+                    f"Requested AMD GPU resources: {gpu_count}"
+                )
             else:
                 # fallback if we never see a recognized manufacturer
                 # (the code above raises an error first, so we might never get here)
@@ -390,16 +452,22 @@ class Executor(RemoteExecutor):
         # Try creating the pod with exception handling
         try:
             pod = self._kubernetes_retry(
-                lambda: self.batchapi.create_namespaced_job(self.namespace, body)
+                lambda: self.batchapi.create_namespaced_job(
+                    self.namespace, body
+                )
             )
         except kubernetes.client.rest.ApiException as e:
             self.logger.error(f"Failed to create pod: {e}")
             raise WorkflowError(f"Failed to create pod: {e}")
 
-        self.logger.info(f"Get status with: kubectl describe job {jobid}")
+        self.logger.info(
+            f"Get status with: kubectl describe job {jobid}"
+        )
 
         self.report_job_submission(
-            SubmittedJobInfo(job=job, external_jobid=jobid, aux={"pod": pod})
+            SubmittedJobInfo(
+                job=job, external_jobid=jobid, aux={"pod": pod}
+            )
         )
 
     async def check_active_jobs(
@@ -429,26 +497,31 @@ class Executor(RemoteExecutor):
                         )
                     )
                 except kubernetes.client.rest.ApiException as e:
-                    self.logger.error(f"ApiException when checking pod status: {e}")
+                    self.logger.error(
+                        f"ApiException when checking pod status: {e}"
+                    )
                     continue
                 except WorkflowError as e:
-                    self.logger.error(f"WorkflowError when checking pod status: {e}")
+                    self.logger.error(
+                        f"WorkflowError when checking pod status: {e}"
+                    )
                     continue
 
                 if res is None:
                     msg = (
-                        "Unknown job {jobid}. Has the job been deleted manually?"
+                        "Unknown job {jobid}. Has the job been deleted "
+                        "manually?"
                     ).format(jobid=j.external_jobid)
                     self.logger.error(msg)
                     self.report_job_error(j, msg=msg)
                     continue
 
-                # Sometimes, just checking the status of a job is not enough, because
-                # apparently, depending on the cluster setup, there can be additional
-                # containers injected into pods that will prevent the job to detect
-                # that a pod is already terminated.
-                # We therefore check the status of the snakemake container in addition
-                # to the job status.
+                # Sometimes, just checking the status of a job is not enough,
+                # because apparently, depending on the cluster setup, there
+                # can be additional containers injected into pods that will
+                # prevent the job to detect that a pod is already terminated.
+                # We therefore check the status of the snakemake container
+                # in addition to the job status.
                 pods = self._kubernetes_retry(
                     lambda j=j: self.kubeapi.list_namespaced_pod(
                         namespace=self.namespace,
@@ -456,7 +529,10 @@ class Executor(RemoteExecutor):
                     )
                 )
                 assert len(pods.items) <= 1
-                if pods.items and pods.items[0].status.container_statuses is not None:
+                if (
+                    pods.items
+                    and pods.items[0].status.container_statuses is not None
+                ):
                     pod = pods.items[0]
                     snakemake_container = [
                         container
@@ -480,21 +556,27 @@ class Executor(RemoteExecutor):
                 ):
                     if pod_name is not None:
                         assert snakemake_container is not None
-                        kube_log = self.log_path / f"{j.external_jobid}.log"
+                        kube_log = (
+                            self.log_path / f"{j.external_jobid}.log"
+                        )
                         with open(kube_log, "w") as f:
 
                             def read_log(
                                 pod_name=pod_name,
                                 container_name=snakemake_container.name,
                             ):
-                                return self.kubeapi.read_namespaced_pod_log(
-                                    name=pod_name,
-                                    namespace=self.namespace,
-                                    container=container_name,
-                                    previous=True,
+                                return (
+                                    self.kubeapi.read_namespaced_pod_log(
+                                        name=pod_name,
+                                        namespace=self.namespace,
+                                        container=container_name,
+                                        previous=True,
+                                    )
                                 )
 
-                            kube_log_content = self._kubernetes_retry(read_log)
+                            kube_log_content = self._kubernetes_retry(
+                                read_log
+                            )
                             print(kube_log_content, file=f)
                         aux_logs = [str(kube_log)]
                         msg = ""
@@ -503,13 +585,18 @@ class Executor(RemoteExecutor):
                             " For details, please issue:\n"
                             f"kubectl describe job {j.external_jobid}. "
                             "Further, make sure to clean up the failed job "
-                            "manually in case it is not deleted automatically: "
-                            "kubectl delete job {j.external_jobid}."
+                            "manually in case it is not deleted "
+                            "automatically: "
+                            f"kubectl delete job {j.external_jobid}."
                         )
                         aux_logs = []
 
-                    self.logger.error(f"Job {j.external_jobid} failed.{msg}")
-                    self.report_job_error(j, msg=msg, aux_logs=aux_logs)
+                    self.logger.error(
+                        f"Job {j.external_jobid} failed.{msg}"
+                    )
+                    self.report_job_error(
+                        j, msg=msg, aux_logs=aux_logs
+                    )
 
                     if (
                         pod_name is not None
@@ -520,14 +607,18 @@ class Executor(RemoteExecutor):
                                 j.external_jobid, ignore_not_found=True
                             )
                         )
-                elif (res.status.succeeded and res.status.succeeded >= 1) or (
-                    snakemake_container_exit_code == 0
-                ):
+                elif (
+                    res.status.succeeded and res.status.succeeded >= 1
+                ) or (snakemake_container_exit_code == 0):
                     # finished
-                    self.logger.info(f"Job {j.external_jobid} succeeded.")
+                    self.logger.info(
+                        f"Job {j.external_jobid} succeeded."
+                    )
                     self.report_job_success(j)
 
-                    if not self.workflow.executor_settings.omit_job_cleanup:
+                    if (
+                        not self.workflow.executor_settings.omit_job_cleanup
+                    ):
                         self._kubernetes_retry(
                             lambda j=j: self.safe_delete_job(
                                 j.external_jobid, ignore_not_found=True
@@ -535,7 +626,9 @@ class Executor(RemoteExecutor):
                         )
                 else:
                     # still active
-                    self.logger.debug(f"Job {j.external_jobid} is still active.")
+                    self.logger.debug(
+                        f"Job {j.external_jobid} is still active."
+                    )
                     yield j
 
     def cancel_jobs(self, active_jobs: List[SubmittedJobInfo]):
@@ -572,8 +665,8 @@ class Executor(RemoteExecutor):
         )
         if config_map_size > 1048576:
             raise WorkflowError(
-                "The total size of the included files and other Kubernetes secrets "
-                f"is {config_map_size}, exceeding the 1MB limit.\n"
+                "The total size of the included files and other Kubernetes "
+                f"secrets is {config_map_size}, exceeding the 1MB limit.\n"
             )
 
         self.kubeapi.create_namespaced_secret(self.namespace, secret)
@@ -593,7 +686,9 @@ class Executor(RemoteExecutor):
         import kubernetes.client
 
         body = kubernetes.client.V1DeleteOptions()
-        self.logger.debug(f"Deleting job {jobid} in namespace {self.namespace}")
+        self.logger.debug(
+            f"Deleting job {jobid} in namespace {self.namespace}"
+        )
         try:
             # Usually, kubernetes should delete the pods automatically
             # when the job is deleted, but in some cases, this does not
@@ -603,18 +698,24 @@ class Executor(RemoteExecutor):
                 label_selector=f"job-name={jobid}",
             )
             for pod in pods.items:
-                self.logger.debug(f"Deleting pod {pod.metadata.name} for job {jobid}")
+                self.logger.debug(
+                    f"Deleting pod {pod.metadata.name} for job {jobid}"
+                )
                 self.kubeapi.delete_namespaced_pod(
                     pod.metadata.name, self.namespace, body=body
                 )
 
             self.batchapi.delete_namespaced_job(
-                jobid, self.namespace, propagation_policy="Foreground", body=body
+                jobid,
+                self.namespace,
+                propagation_policy="Foreground",
+                body=body,
             )
         except kubernetes.client.rest.ApiException as e:
             if e.status == 404 and ignore_not_found:
                 self.logger.debug(
-                    "[WARNING] 404 not found when trying to delete the job: {jobid}\n"
+                    "[WARNING] 404 not found when trying to delete the "
+                    "job: {jobid}\n"
                     "[WARNING] Ignore this error\n".format(jobid=jobid)
                 )
             else:
