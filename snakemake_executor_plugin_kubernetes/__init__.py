@@ -123,6 +123,15 @@ class ExecutorSettings(ExecutorSettingsBase):
             "nargs": "+",
         },
     )
+    home_dir: Optional[str] = field(
+        default_factory=lambda: os.environ.get("HOME", None),
+        metadata={
+            "help": "Set HOME in job containers. "
+            "Defaults to the current $HOME. "
+            "Required when the job container image has no /etc/passwd entry "
+            "for the UID, causing Python to fall back to / as the home."
+        },
+    )
     omit_job_cleanup: bool = field(
         default=False,
         metadata={
@@ -159,11 +168,12 @@ common_settings = CommonSettings(
 # Implementation of your executor
 class Executor(RemoteExecutor):
     def __post_init__(self):
-        # Attempt loading kube_config or in-cluster config
+        # Prefer in-cluster config (service account token) when running
+        # inside a pod, fall back to ~/.kube/config for local dev.
         try:
-            kubernetes.config.load_kube_config()
-        except kubernetes.config.config_exception.ConfigException:
             kubernetes.config.load_incluster_config()
+        except kubernetes.config.config_exception.ConfigException:
+            kubernetes.config.load_kube_config()
 
         self.k8s_cpu_scalar = self.workflow.executor_settings.cpu_scalar
         self.k8s_service_account_name = (
@@ -171,6 +181,7 @@ class Executor(RemoteExecutor):
         )
         self.k8s_run_as_user = self.workflow.executor_settings.run_as_user
         self.k8s_run_as_group = self.workflow.executor_settings.run_as_group
+        self.k8s_home_dir = self.workflow.executor_settings.home_dir
         self.kubeapi = kubernetes.client.CoreV1Api()
         self.batchapi = kubernetes.client.BatchV1Api()
         self.namespace = self.workflow.executor_settings.namespace
@@ -372,6 +383,15 @@ class Executor(RemoteExecutor):
 
         # Env vars
         container.env = []
+
+        # Set HOME so Python/snakemake caches land in the right place.
+        # Without this, containers with no /etc/passwd entry for the UID
+        # default to / and hit PermissionError on /.cache.
+        if self.k8s_home_dir:
+            container.env.append(
+                kubernetes.client.V1EnvVar(name="HOME", value=self.k8s_home_dir)
+            )
+
         for key, e in self.secret_envvars.items():
             envvar = kubernetes.client.V1EnvVar(name=e)
             envvar.value_from = kubernetes.client.V1EnvVarSource()
@@ -586,7 +606,6 @@ class Executor(RemoteExecutor):
                                         name=pod_name,
                                         namespace=self.namespace,
                                         container=container_name,
-                                        previous=True,
                                     )
                                 )
 
@@ -744,8 +763,11 @@ class Executor(RemoteExecutor):
         # Reload config in order to ensure token is
         # refreshed. Then try again.
         self.logger.info("Trying to reauthenticate")
-        kubernetes.config.load_kube_config()
-        subprocess.run(["kubectl", "get", "nodes"])
+        try:
+            kubernetes.config.load_incluster_config()
+        except kubernetes.config.config_exception.ConfigException:
+            kubernetes.config.load_kube_config()
+            subprocess.run(["kubectl", "get", "nodes"])
 
         self.kubeapi = kubernetes.client.CoreV1Api()
         self.batchapi = kubernetes.client.BatchV1Api()
