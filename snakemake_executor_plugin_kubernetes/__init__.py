@@ -157,14 +157,12 @@ class ExecutorSettings(ExecutorSettingsBase):
             "automatic cleanups."
         },
     )
-    custom_labels: dict = field(
-        default_factory=dict,
+    custom_labels: List[str] = field(
+        default_factory=list,
         metadata={
             "help": "Additional labels to apply to each job pod "
             "(key=value). For example: "
             "com.example.team=data-eng com.example.env=prod",
-            "parse_func": parse_custom_labels,
-            "unparse_func": unparse_custom_labels,
             "nargs": "+",
         },
     )
@@ -224,7 +222,9 @@ class Executor(RemoteExecutor):
         )
         self.privileged = self.workflow.executor_settings.privileged
         self.persistent_volumes = self.workflow.executor_settings.persistent_volumes
-        self.custom_labels = dict(self.workflow.executor_settings.custom_labels)
+        self.custom_labels = parse_custom_labels(
+            self.workflow.executor_settings.custom_labels
+        )
         # Capture the workflow working directory so job pods can run in the
         # same directory on the shared filesystem instead of /workdir.
         self.workdir = os.getcwd()
