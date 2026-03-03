@@ -360,7 +360,10 @@ class Executor(RemoteExecutor):
         )
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
-            template=kubernetes.client.V1PodTemplateSpec(spec=pod_spec),
+            template=kubernetes.client.V1PodTemplateSpec(
+                metadata=kubernetes.client.V1ObjectMeta(labels=job_labels),
+                spec=pod_spec,
+            ),
         )
 
         # Add toleration for GPU nodes if GPU is requested
